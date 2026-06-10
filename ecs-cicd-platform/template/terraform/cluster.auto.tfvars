@@ -1,0 +1,20 @@
+region                 = "YOUR_REGION"
+vpc_id                 = "YOUR_VPC_ID"
+subnet_name            = "your-private-subnet-name"
+ecs_instance_ami       = "YOUR_ECS_OPTIMIZED_AMI"
+instance_type          = "t3a.medium"
+ssl_cert_arn           = "arn:aws:acm:YOUR_REGION:YOUR_ACCOUNT_ID:certificate/your-certificate-id"
+alb_id                 = "arn:aws:elasticloadbalancing:YOUR_REGION:YOUR_ACCOUNT_ID:loadbalancer/app/your-alb-name/your-alb-id"
+lb_sec_gr_id           = "YOUR_LB_SECURITY_GROUP_ID"
+ecr_registry           = "YOUR_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com"
+default_resource_name  = "your-project-PRODUCTION"
+project_name           = "your-project"
+environment            = "production"
+alert_topic_arn        = "arn:aws:sns:YOUR_REGION:YOUR_ACCOUNT_ID:your-alert-sns-topic"
+
+# Service image versions — typically injected by CI/CD via TF_VAR_* env vars.
+# You can also set them here for manual deploys.
+# YOUR_SERVICE_1_VERSION = "prod.1.0.0"
+# YOUR_SERVICE_2_VERSION = "prod.1.0.0"
+# YOUR_SERVICE_3_VERSION = "prod.1.0.0"
+# YOUR_SERVICE_4_VERSION = "prod.1.0.0"

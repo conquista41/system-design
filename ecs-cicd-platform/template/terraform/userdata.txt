@@ -1,0 +1,8 @@
+#!/bin/bash
+echo ECS_CLUSTER=${cluster_name} >> /etc/ecs/ecs.config
+echo ECS_IMAGE_PULL_BEHAVIOR=always >> /etc/ecs/ecs.config
+yum install -y cronie
+systemctl start crond
+systemctl enable crond
+echo "0 3 * * 0 docker image prune -f" | crontab -
+

@@ -1,0 +1,544 @@
+// ══════════════════════════════════════════════════════════════════
+// ECS CI/CD Platform — Production Jenkins Pipeline
+// ══════════════════════════════════════════════════════════════════
+// 10-stage declarative pipeline with:
+//   - Semantic version management (versions.properties)
+//   - Docker build with --build-arg injection
+//   - Trivy vulnerability scan (fails on CRITICAL CVEs)
+//   - ECR push with version-tagged images
+//   - Production approval gate (input step, 30-min timeout)
+//   - Terraform init + plan + apply (infra drift correction)
+//   - ECS force-new-deployment (dev: fast replace / prod: rolling)
+//   - Smoke test (curl health endpoints, fail on non-200)
+//   - Post: Slack notifications + workspace cleanup
+//
+// Placeholders to replace before use:
+//   YOUR_REGION           AWS region (e.g. eu-west-1)
+//   YOUR_ACCOUNT_ID       12-digit AWS account ID
+//   YOUR_PROJECT_NAME     Project prefix used in ECR paths and image tags
+//   YOUR_CLUSTER_NAME     ECS cluster name (matches Terraform default_resource_name)
+//   YOUR_SERVICE_1/2/3    ECS service keys (match var.services keys in Terraform)
+//   YOUR_SLACK_CHANNEL    Slack channel for notifications (e.g. #deployments)
+//   YOUR_PIPELINE_CRED_ID Jenkins credential ID for the source/pipeline repo
+//   YOUR_ENV_FILES_CRED_ID Jenkins credential ID for the env-files private repo
+//   YOUR_ENV_FILES_REPO   Git URL of private repo containing .env / tfvars files
+//   YOUR_ALB_DNS          ALB DNS name or read from Terraform output (see Stage 10)
+// ══════════════════════════════════════════════════════════════════
+
+pipeline {
+    agent any
+
+    // ── Environment Variables ─────────────────────────────────────
+    environment {
+        // AWS configuration
+        AWS_REGION      = "YOUR_REGION"
+        AWS_ACCOUNT_ID  = "YOUR_ACCOUNT_ID"
+        ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+        // Project & cluster
+        PROJECT_NAME    = "YOUR_PROJECT_NAME"
+        CLUSTER_NAME    = "YOUR_CLUSTER_NAME"
+
+        // "dev" or "prod" — set this per pipeline, or inject via build parameter
+        DEPLOY_ENV      = "dev"
+
+        // Slack channel for success / failure notifications
+        SLACK_CHANNEL   = "YOUR_SLACK_CHANNEL"
+
+        // Populated at runtime — do not set static values here
+        FAILED_STAGE    = "unknown"
+        ALB_DNS         = ""
+
+        // Populated in Stage 3 from versions.properties; one variable per service
+        VER_YOUR_SERVICE_1 = ""
+        VER_YOUR_SERVICE_2 = ""
+        VER_YOUR_SERVICE_3 = ""
+    }
+
+    stages {
+
+        // ─────────────────────────────────────────────────────────
+        // STAGE 1 — Clone Pipeline Files
+        // Checks out the application source repository.
+        // Credentials are pulled from the Jenkins credential store —
+        // never hardcode tokens or SSH keys in the Jenkinsfile.
+        // ─────────────────────────────────────────────────────────
+        stage("1 · Clone Pipeline Files") {
+            steps {
+                script { env.FAILED_STAGE = env.STAGE_NAME }
+
+                echo "==> Cloning pipeline source (branch: ${env.GIT_BRANCH})"
+
+                // Standard Jenkins SCM checkout configured in the job definition.
+                // Binds credentials stored under YOUR_PIPELINE_CRED_ID.
+                checkout([
+                    $class: "GitSCM",
+                    branches: [[name: "*/${env.GIT_BRANCH ?: 'main'}"]],
+                    userRemoteConfigs: [[
+                        credentialsId: "YOUR_PIPELINE_CRED_ID",
+                        url: "${env.GIT_URL}"
+                    ]]
+                ])
+
+                echo "==> Source checkout complete"
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STAGE 2 — Clone Env Files
+        // Fetches a separate PRIVATE repository containing environment-
+        // specific configuration: .env files, tfvars overrides, certs.
+        // Keeping secrets in a separate repo limits blast radius if the
+        // application repo is accidentally made public.
+        // ─────────────────────────────────────────────────────────
+        // NOTE: This stage pulls .env files from a separate private repo.
+        // Alternative: use AWS Secrets Manager or SSM Parameter Store
+        // to inject secrets at container start — no file cloning needed.
+        // See: services.tf → container_definitions → secrets block
+        stage("2 · Clone Env Files") {
+            steps {
+                script { env.FAILED_STAGE = env.STAGE_NAME }
+
+                echo "==> Cloning env-files repo for environment: ${DEPLOY_ENV}"
+
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: "YOUR_ENV_FILES_CRED_ID",
+                    keyFileVariable: "SSH_KEY"
+                )]) {
+                    sh """
+                        GIT_SSH_COMMAND="ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no" \\
+                            git clone --depth 1 \\
+                            --branch ${DEPLOY_ENV} \\
+                            YOUR_ENV_FILES_REPO \\
+                            env-files/
+                    """
+                }
+
+                echo "==> Env files cloned to env-files/"
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STAGE 3 — Read Service Versions
+        // Parses versions.properties to get the current deployed version
+        // of each service. The pipeline can optionally increment these;
+        // for simplicity this template reads them and uses them as-is.
+        //
+        // versions.properties format:
+        //   YOUR_SERVICE_1=1.4.2
+        //   YOUR_SERVICE_2=1.4.2
+        //   YOUR_SERVICE_3=0.9.1
+        // ─────────────────────────────────────────────────────────
+        stage("3 · Read Service Versions") {
+            steps {
+                script {
+                    env.FAILED_STAGE = env.STAGE_NAME
+
+                    // Read versions from properties file
+                    def versionFile = readFile("versions.properties").trim()
+
+                    // Helper closure: extract version for a named service
+                    def parseVersion = { service ->
+                        def match = (versionFile =~ /(?m)^${service}=(.+)$/)
+                        if (!match) error("No version found for service '${service}' in versions.properties")
+                        return match[0][1].trim()
+                    }
+
+                    // Read each service version and expose as an env variable
+                    env.VER_YOUR_SERVICE_1 = parseVersion("YOUR_SERVICE_1")
+                    env.VER_YOUR_SERVICE_2 = parseVersion("YOUR_SERVICE_2")
+                    env.VER_YOUR_SERVICE_3 = parseVersion("YOUR_SERVICE_3")
+
+                    echo "==> Versions read:"
+                    echo "    YOUR_SERVICE_1 = ${env.VER_YOUR_SERVICE_1}"
+                    echo "    YOUR_SERVICE_2 = ${env.VER_YOUR_SERVICE_2}"
+                    echo "    YOUR_SERVICE_3 = ${env.VER_YOUR_SERVICE_3}"
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STAGE 4 — Prepare Image Tags
+        // Constructs full ECR image URIs for each service.
+        // Tag format: DEPLOY_ENV.MAJOR.MINOR.PATCH
+        //   e.g. prod.1.4.2 / dev.0.12.1
+        // ─────────────────────────────────────────────────────────
+        stage("4 · Prepare Image Tags") {
+            steps {
+                script {
+                    env.FAILED_STAGE = env.STAGE_NAME
+
+                    // Build tagged image names for local Docker and ECR
+                    env.LOCAL_TAG_SVC1  = "${PROJECT_NAME}/YOUR_SERVICE_1:${DEPLOY_ENV}.${env.VER_YOUR_SERVICE_1}"
+                    env.LOCAL_TAG_SVC2  = "${PROJECT_NAME}/YOUR_SERVICE_2:${DEPLOY_ENV}.${env.VER_YOUR_SERVICE_2}"
+                    env.LOCAL_TAG_SVC3  = "${PROJECT_NAME}/YOUR_SERVICE_3:${DEPLOY_ENV}.${env.VER_YOUR_SERVICE_3}"
+
+                    env.ECR_TAG_SVC1    = "${ECR_REGISTRY}/${PROJECT_NAME}/YOUR_SERVICE_1:${DEPLOY_ENV}.${env.VER_YOUR_SERVICE_1}"
+                    env.ECR_TAG_SVC2    = "${ECR_REGISTRY}/${PROJECT_NAME}/YOUR_SERVICE_2:${DEPLOY_ENV}.${env.VER_YOUR_SERVICE_2}"
+                    env.ECR_TAG_SVC3    = "${ECR_REGISTRY}/${PROJECT_NAME}/YOUR_SERVICE_3:${DEPLOY_ENV}.${env.VER_YOUR_SERVICE_3}"
+
+                    echo "==> Image tags prepared:"
+                    echo "    ${env.ECR_TAG_SVC1}"
+                    echo "    ${env.ECR_TAG_SVC2}"
+                    echo "    ${env.ECR_TAG_SVC3}"
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STAGE 5 — Build Docker Images
+        // Builds all service images from a single Dockerfile using
+        // --build-arg to parameterise ENV and SERVICE.
+        // If services have separate Dockerfiles, adjust each
+        // docker build command to point to the right context.
+        // ─────────────────────────────────────────────────────────
+        stage("5 · Build Docker Images") {
+            steps {
+                script { env.FAILED_STAGE = env.STAGE_NAME }
+
+                echo "==> Building Docker images for environment: ${DEPLOY_ENV}"
+
+                sh """
+                    # YOUR_SERVICE_1
+                    docker build \\
+                        --build-arg ENV=${DEPLOY_ENV} \\
+                        --build-arg SERVICE=YOUR_SERVICE_1 \\
+                        -t ${env.LOCAL_TAG_SVC1} \\
+                        .
+
+                    # YOUR_SERVICE_2
+                    docker build \\
+                        --build-arg ENV=${DEPLOY_ENV} \\
+                        --build-arg SERVICE=YOUR_SERVICE_2 \\
+                        -t ${env.LOCAL_TAG_SVC2} \\
+                        .
+
+                    # YOUR_SERVICE_3
+                    docker build \\
+                        --build-arg ENV=${DEPLOY_ENV} \\
+                        --build-arg SERVICE=YOUR_SERVICE_3 \\
+                        -t ${env.LOCAL_TAG_SVC3} \\
+                        .
+                """
+
+                echo "==> All images built"
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STAGE 6 — Security Scan (Trivy)
+        // Scans each image for known CVEs.
+        //   --exit-code 1      fail the build if vulnerabilities found
+        //   --severity CRITICAL only block on CRITICAL (not HIGH/MEDIUM)
+        //   --ignore-unfixed   skip CVEs that have no fix available
+        //
+        // Trivy must be installed on the Jenkins agent.
+        // Install: https://aquasecurity.github.io/trivy/latest/getting-started/installation/
+        // ─────────────────────────────────────────────────────────
+        stage("6 · Security Scan (Trivy)") {
+            steps {
+                script { env.FAILED_STAGE = env.STAGE_NAME }
+
+                echo "==> Running Trivy vulnerability scan"
+
+                sh """
+                    for IMAGE in \\
+                        "${env.LOCAL_TAG_SVC1}" \\
+                        "${env.LOCAL_TAG_SVC2}" \\
+                        "${env.LOCAL_TAG_SVC3}"; do
+
+                        echo "── Scanning: \${IMAGE} ──────────────────────────"
+                        trivy image \\
+                            --exit-code 1 \\
+                            --severity CRITICAL \\
+                            --ignore-unfixed \\
+                            --no-progress \\
+                            "\${IMAGE}"
+                        echo "  ✓ Scan passed: \${IMAGE}"
+                    done
+                """
+
+                echo "==> All images passed Trivy scan"
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STAGE 7 — Push to ECR
+        // Authenticates to ECR (one auth token covers all repos in
+        // the same account + region), tags, and pushes each image.
+        // ─────────────────────────────────────────────────────────
+        stage("7 · Push to ECR") {
+            steps {
+                script { env.FAILED_STAGE = env.STAGE_NAME }
+
+                echo "==> Authenticating to ECR: ${ECR_REGISTRY}"
+                sh """
+                    aws ecr get-login-password --region ${AWS_REGION} \\
+                        | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                """
+
+                echo "==> Tagging and pushing images"
+                sh """
+                    docker tag ${env.LOCAL_TAG_SVC1} ${env.ECR_TAG_SVC1}
+                    docker push ${env.ECR_TAG_SVC1}
+                    echo "  ✓ Pushed: ${env.ECR_TAG_SVC1}"
+
+                    docker tag ${env.LOCAL_TAG_SVC2} ${env.ECR_TAG_SVC2}
+                    docker push ${env.ECR_TAG_SVC2}
+                    echo "  ✓ Pushed: ${env.ECR_TAG_SVC2}"
+
+                    docker tag ${env.LOCAL_TAG_SVC3} ${env.ECR_TAG_SVC3}
+                    docker push ${env.ECR_TAG_SVC3}
+                    echo "  ✓ Pushed: ${env.ECR_TAG_SVC3}"
+                """
+
+                echo "==> All images pushed to ECR"
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // APPROVAL GATE — Production only
+        // Pauses the pipeline and waits for explicit human approval
+        // before touching production infrastructure.
+        // Times out after 30 minutes → pipeline is aborted.
+        // Only runs when DEPLOY_ENV == "prod".
+        // ─────────────────────────────────────────────────────────
+        stage("· Approval Gate") {
+            when {
+                expression { env.DEPLOY_ENV == "prod" }
+            }
+            steps {
+                script { env.FAILED_STAGE = env.STAGE_NAME }
+
+                echo "==> Waiting for production deployment approval..."
+
+                timeout(time: 30, unit: "MINUTES") {
+                    input(
+                        message: "Deploy to PRODUCTION?",
+                        ok: "Approve",
+                        submitter: "ops-team,lead-engineer", // Restrict to specific Jenkins user groups
+                        parameters: [
+                            string(
+                                name: "REASON",
+                                defaultValue: "",
+                                description: "Optional: reason for deployment (logged in build history)"
+                            )
+                        ]
+                    )
+                }
+
+                echo "==> Production deployment approved — proceeding"
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STAGE 8 — Terraform Init + Plan + Apply
+        // Initialises the S3 backend, validates changes, and applies.
+        // Runs on every deployment — this corrects any infra drift
+        // (e.g. a manually changed target group or listener rule).
+        // The new image versions are passed as -var to update task definitions.
+        // ─────────────────────────────────────────────────────────
+        stage("8 · Terraform Init + Plan + Apply") {
+            steps {
+                script { env.FAILED_STAGE = env.STAGE_NAME }
+
+                echo "==> Initialising Terraform backend (env: ${DEPLOY_ENV})"
+                dir("terraform") {
+                    sh """
+                        terraform init -reconfigure \\
+                            -backend-config="bucket=YOUR_TERRAFORM_STATE_BUCKET" \\
+                            -backend-config="key=${PROJECT_NAME}/${DEPLOY_ENV}/terraform.tfstate" \\
+                            -backend-config="region=${AWS_REGION}" \\
+                            -backend-config="dynamodb_table=YOUR_TERRAFORM_LOCK_TABLE" \\
+                            -backend-config="encrypt=true"
+                    """
+
+                    echo "==> Planning Terraform changes"
+                    sh """
+                        terraform plan \\
+                            -var-file="terraform.tfvars" \\
+                            -var='service_versions={
+                                "YOUR_SERVICE_1":"${env.VER_YOUR_SERVICE_1}",
+                                "YOUR_SERVICE_2":"${env.VER_YOUR_SERVICE_2}",
+                                "YOUR_SERVICE_3":"${env.VER_YOUR_SERVICE_3}"
+                            }' \\
+                            -out=tfplan
+                    """
+
+                    echo "==> Applying Terraform plan"
+                    sh "terraform apply -auto-approve tfplan"
+
+                    // Capture ALB DNS for smoke test
+                    env.ALB_DNS = sh(
+                        script: "terraform output -raw alb_dns_name",
+                        returnStdout: true
+                    ).trim()
+                }
+
+                echo "==> Terraform apply complete. ALB DNS: ${env.ALB_DNS}"
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STAGE 9 — ECS Force Deploy
+        // Forces ECS to replace running tasks with those using the
+        // new task definition (updated by Terraform in Stage 8).
+        //
+        // Dev:  min=0%  max=100%  → kill old first, start new (fast)
+        // Prod: min=50% max=200%  → start new first, drain old (rolling)
+        // ─────────────────────────────────────────────────────────
+        stage("9 · ECS Force Deploy") {
+            steps {
+                script {
+                    env.FAILED_STAGE = env.STAGE_NAME
+
+                    def minHealthy = (env.DEPLOY_ENV == "prod") ? 50  : 0
+                    def maxPercent = (env.DEPLOY_ENV == "prod") ? 200 : 100
+
+                    echo "==> Force-deploying ECS services on cluster: ${CLUSTER_NAME}"
+                    echo "    minimumHealthyPercent=${minHealthy}, maximumPercent=${maxPercent}"
+
+                    def services = [
+                        "${CLUSTER_NAME}-YOUR_SERVICE_1-service",
+                        "${CLUSTER_NAME}-YOUR_SERVICE_2-service",
+                        "${CLUSTER_NAME}-YOUR_SERVICE_3-service",
+                    ]
+
+                    services.each { svc ->
+                        echo "  → Deploying: ${svc}"
+                        sh """
+                            aws ecs update-service \\
+                                --region ${AWS_REGION} \\
+                                --cluster ${CLUSTER_NAME} \\
+                                --service ${svc} \\
+                                --deployment-configuration \\
+                                    minimumHealthyPercent=${minHealthy},maximumPercent=${maxPercent} \\
+                                --force-new-deployment \\
+                                --no-cli-pager
+                        """
+                    }
+                }
+
+                echo "==> All services triggered for rolling update"
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STAGE 10 — Smoke Test
+        // Waits up to 120 seconds for each service to stabilise,
+        // then curls the health check endpoint via the ALB.
+        // Fails the pipeline if any endpoint returns non-200.
+        //
+        // Uses the ALB DNS read from Terraform output in Stage 8.
+        // ─────────────────────────────────────────────────────────
+        stage("10 · Smoke Test") {
+            steps {
+                script { env.FAILED_STAGE = env.STAGE_NAME }
+
+                echo "==> Running smoke tests against ALB: ${env.ALB_DNS}"
+
+                sh """
+                    # Health check endpoints — adjust paths to match your services
+                    declare -A HEALTH_ENDPOINTS=(
+                        ["YOUR_SERVICE_1"]="/YOUR_SERVICE_1/health"
+                        ["YOUR_SERVICE_2"]="/YOUR_SERVICE_2/health"
+                        ["YOUR_SERVICE_3"]="/YOUR_SERVICE_3/health"
+                    )
+
+                    # Wait for services to stabilise before testing (ECS rolling deploy in progress)
+                    echo "Waiting 60s for tasks to become healthy..."
+                    sleep 60
+
+                    FAILED=0
+
+                    for SERVICE in "\${!HEALTH_ENDPOINTS[@]}"; do
+                        ENDPOINT="\${HEALTH_ENDPOINTS[\$SERVICE]}"
+                        URL="https://${env.ALB_DNS}\${ENDPOINT}"
+
+                        echo "── Testing: \${SERVICE} → \${URL}"
+
+                        # Retry up to 4 times with 15-second intervals (total: 60s)
+                        SUCCESS=0
+                        for ATTEMPT in 1 2 3 4; do
+                            HTTP_STATUS=\$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 "\${URL}")
+                            if [ "\${HTTP_STATUS}" = "200" ]; then
+                                echo "  ✓ \${SERVICE} returned 200 (attempt \${ATTEMPT})"
+                                SUCCESS=1
+                                break
+                            else
+                                echo "  ✗ \${SERVICE} returned \${HTTP_STATUS} (attempt \${ATTEMPT}/4)"
+                                if [ "\${ATTEMPT}" -lt 4 ]; then
+                                    echo "    Retrying in 15s..."
+                                    sleep 15
+                                fi
+                            fi
+                        done
+
+                        if [ "\${SUCCESS}" -eq 0 ]; then
+                            echo "  FAILED: \${SERVICE} did not return 200 after 4 attempts"
+                            FAILED=1
+                        fi
+                    done
+
+                    if [ "\${FAILED}" -eq 1 ]; then
+                        echo ""
+                        echo "Smoke tests FAILED — one or more services did not respond with 200."
+                        exit 1
+                    fi
+
+                    echo ""
+                    echo "All smoke tests passed."
+                """
+
+                echo "==> Smoke tests complete — deployment verified"
+            }
+        }
+    } // end stages
+
+
+    // ── Post-Pipeline Actions ─────────────────────────────────────
+    post {
+
+        // Always: clean the workspace so stale files cannot affect the next build.
+        always {
+            echo "==> Cleaning workspace"
+            cleanWs()
+
+            // Remove local Docker images to prevent disk fill on the Jenkins agent.
+            sh """
+                docker image rm -f ${env.LOCAL_TAG_SVC1} || true
+                docker image rm -f ${env.LOCAL_TAG_SVC2} || true
+                docker image rm -f ${env.LOCAL_TAG_SVC3} || true
+                docker image rm -f ${env.ECR_TAG_SVC1}  || true
+                docker image rm -f ${env.ECR_TAG_SVC2}  || true
+                docker image rm -f ${env.ECR_TAG_SVC3}  || true
+            """
+        }
+
+        // Success: notify Slack with version and environment.
+        success {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: "good",
+                message: """:white_check_mark: *Deploy succeeded*
+• *Job:*    ${env.JOB_NAME} #${env.BUILD_NUMBER}
+• *Env:*    ${env.DEPLOY_ENV}
+• *Build:*  <${env.BUILD_URL}|View build>"""
+            )
+        }
+
+        // Failure: notify Slack with the name of the stage that failed.
+        failure {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: "danger",
+                message: """:x: *Deploy FAILED*
+• *Job:*    ${env.JOB_NAME} #${env.BUILD_NUMBER}
+• *Env:*    ${env.DEPLOY_ENV}
+• *Stage:*  ${env.FAILED_STAGE}
+• *Build:*  <${env.BUILD_URL}console|View logs>"""
+            )
+        }
+
+    } // end post
+} // end pipeline
