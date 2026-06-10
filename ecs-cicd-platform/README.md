@@ -66,6 +66,150 @@ Port 22 is closed on all EC2 instances. Access is via AWS Systems Manager Sessio
 
 ---
 
+## Architecture
+
+### AWS Infrastructure
+
+```mermaid
+graph TD
+    Users([Internet / Users])
+
+    Users -->|HTTPS 443| ALB["Application Load Balancer
+    HTTP 80 → HTTPS 301 redirect
+    TLS 1.3 · ELBSecurityPolicy-TLS13-1-2-2021-06
+    Default action: 503 fixed-response"]
+
+    ALB -->|/service1/*| TG1["Target Group · YOUR_SERVICE_1
+    Port 8080 · health: /service1/health"]
+
+    ALB -->|/service2/*| TG2["Target Group · YOUR_SERVICE_2
+    Port 8080 · health: /service2/health"]
+
+    ALB -->|/service3/*| TG3["Target Group · YOUR_SERVICE_3
+    Port 8080 · health: /service3/health"]
+
+    TG1 --> Svc1["ECS Service · YOUR_SERVICE_1
+    Bridge mode · autoscaling: mem 65%"]
+    TG2 --> Svc2["ECS Service · YOUR_SERVICE_2
+    Bridge mode · autoscaling: mem 65%"]
+    TG3 --> Svc3["ECS Service · YOUR_SERVICE_3
+    Bridge mode · autoscaling: mem 65%"]
+
+    Svc1 --> EC2
+    Svc2 --> EC2
+    Svc3 --> EC2
+
+    EC2["EC2 Instances
+    ECS-optimized AMI
+    IMDSv2 enforced
+    SSH disabled · SSM access only"]
+
+    EC2 --> ASG["Auto Scaling Group
+    dev:  min 1 / max 1
+    prod: min 1 / max 3
+    ECS Managed Scaling · target 85%"]
+
+    ASG --> Cluster["ECS Cluster
+    EC2 launch type
+    Container Insights: enabled"]
+
+    Cluster --- CP["ECS Capacity Provider
+    Managed scaling · instance_warmup_period: 60s"]
+
+    ECR["ECR · one repo per service
+    Image tag: env.MAJOR.MINOR.PATCH"]
+
+    ECR -->|pull on task start| Svc1
+    ECR -->|pull on task start| Svc2
+    ECR -->|pull on task start| Svc3
+
+    EC2 -->|stdout/stderr| CWLogs["CloudWatch Logs
+    Retention: 7d dev / 30d prod"]
+
+    CWLogs --> Alarms["CloudWatch Alarms
+    EC2: CPU · memory · disk
+    ECS: CPU · memory reservation
+    Per service: CPU · memory · RunningTaskCount
+    ALB: UnhealthyHosts · 5xx · OOM kills"]
+
+    Alarms -->|notify| SNS["SNS Topic → PagerDuty / Slack / Email"]
+
+    subgraph "Terraform Remote State"
+        S3tf["S3 · encrypted + versioned"]
+        DDB["DynamoDB · state lock"]
+    end
+
+    subgraph "Jenkins CI/CD"
+        Jenkins["Jenkins · 10-stage pipeline
+        Trivy scan · approval gate · smoke test"]
+        Jenkins -->|docker push| ECR
+        Jenkins -->|terraform apply| Cluster
+        Jenkins -->|ecs update-service| Svc1
+        Jenkins -->|ecs update-service| Svc2
+        Jenkins -->|ecs update-service| Svc3
+    end
+```
+
+> Full diagram with IAM, security group, and Secrets Manager detail: [`architecture/infrastructure.md`](architecture/infrastructure.md)
+
+---
+
+### CI/CD Pipeline
+
+```mermaid
+flowchart TD
+    Push(["Git Push
+    dev / prod branch"])
+
+    Push --> S1["1 · Clone Pipeline Files"]
+    S1 --> S2["2 · Clone Env Files"]
+    S2 --> S3["3 · Read Service Versions
+    Parse versions.properties"]
+    S3 --> S4["4 · Prepare Image Tags
+    ACCOUNT.dkr.ecr.REGION.amazonaws.com
+    /PROJECT/SERVICE:ENV.MAJOR.MINOR.PATCH"]
+    S4 --> S5["5 · Build Docker Images
+    docker build --build-arg ENV --build-arg SERVICE"]
+    S5 --> S6["6 · Security Scan (Trivy)
+    --severity CRITICAL --ignore-unfixed
+    Fails on any CRITICAL CVE"]
+    S6 --> S7["7 · Push to ECR"]
+
+    S7 --> Gate{"Prod deploy?"}
+
+    Gate -->|yes| Approval["⏸ Approval Gate
+    Explicit human approval required
+    30-minute timeout"]
+
+    Gate -->|no - dev| S8
+
+    Approval --> S8
+
+    S8["8 · Terraform Init + Plan + Apply
+    Updates task defs · corrects drift"]
+    S8 --> S9["9 · ECS Force Deploy
+    dev:  min=0%  max=100%  fast
+    prod: min=50% max=200%  rolling"]
+    S9 --> S10["10 · Smoke Test
+    curl each /health endpoint
+    Fail if non-200 within 120s"]
+    S10 --> Done(["Deploy complete"])
+
+    classDef stage    fill:#232F3E,color:#FF9900,stroke:#FF9900
+    classDef gate     fill:#7B2D8B,color:#fff,stroke:#9B4DB0
+    classDef terminal fill:#1A6B3C,color:#fff,stroke:#1A6B3C
+    classDef decision fill:#0073BB,color:#fff,stroke:#005A8E
+
+    class S1,S2,S3,S4,S5,S6,S7,S8,S9,S10 stage
+    class Approval gate
+    class Push,Done terminal
+    class Gate decision
+```
+
+> Full diagram with stage breakdown, dev vs prod config, and version tagging convention: [`architecture/cicd-pipeline.md`](architecture/cicd-pipeline.md)
+
+---
+
 ## Prerequisites
 
 | Tool | Version | Purpose |

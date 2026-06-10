@@ -25,6 +25,35 @@ See [`ecs-cicd-platform/README.md`](ecs-cicd-platform/README.md) for full docume
 
 ---
 
+## Architecture Overview
+
+```mermaid
+graph LR
+    Users([Users]) -->|HTTPS| ALB["ALB
+    path-based routing"]
+
+    ALB -->|/svc1/*| S1["ECS Service 1"]
+    ALB -->|/svc2/*| S2["ECS Service 2"]
+    ALB -->|/svc3/*| S3["ECS Service 3"]
+
+    S1 & S2 & S3 --> EC2["EC2 · ECS Cluster
+    IMDSv2 · SSM only
+    Auto Scaling Group"]
+
+    ECR["ECR"] -->|image pull| EC2
+    Jenkins["Jenkins
+    10-stage pipeline"] -->|build + push| ECR
+    Jenkins -->|terraform apply| EC2
+    Jenkins -->|force deploy| S1 & S2 & S3
+
+    EC2 --> CW["CloudWatch
+    Logs · Alarms · SNS"]
+```
+
+> Detailed diagram with IAM, security groups, CloudWatch alarms, and Terraform state: [`ecs-cicd-platform/architecture/infrastructure.md`](ecs-cicd-platform/architecture/infrastructure.md)
+
+---
+
 ## Repository Layout
 
 ```
