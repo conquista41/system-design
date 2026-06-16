@@ -1,6 +1,6 @@
 # CI/CD Pipeline
 
-A 10-stage Jenkins pipeline that handles the full lifecycle: version management, Docker build, security scan, ECR push, infrastructure update, ECS deployment, and smoke testing. A mandatory approval gate fires before any production deploy.
+An 11-stage Jenkins pipeline that handles the full lifecycle: version management, Checkov IaC scan, Docker build, container security scan, ECR push, infrastructure update, ECS deployment, and smoke testing. A mandatory approval gate fires before any production deploy.
 
 ---
 
@@ -21,7 +21,13 @@ flowchart TD
     containing .env / tfvars files
     for this environment"]
 
-    S2 --> S3["3 · Read Service Versions
+    S2 --> S2b["2b · IaC Security Scan (Checkov)
+    checkov -d terraform/
+    Scans all .tf files for misconfigurations
+    Hard fail: HIGH · CRITICAL
+    Soft fail: MEDIUM · LOW"]
+
+    S2b --> S3["3 · Read Service Versions
     Parse versions.properties
     for each service version
     e.g. YOUR_SERVICE_1=1.4.2"]
@@ -37,7 +43,7 @@ flowchart TD
     --build-arg SERVICE=name
     One Dockerfile → N images"]
 
-    S5 --> S6["6 · Security Scan
+    S5 --> S6["6 · Image Scan (Trivy)
     trivy image --severity CRITICAL
     --ignore-unfixed --exit-code 1
     Fails build on any CRITICAL CVE
@@ -84,11 +90,13 @@ flowchart TD
     Version committed to git"])
 
     classDef stage    fill:#232F3E,color:#FF9900,stroke:#FF9900
+    classDef iac      fill:#B7410E,color:#fff,stroke:#8B2500
     classDef gate     fill:#7B2D8B,color:#fff,stroke:#9B4DB0
     classDef terminal fill:#1A6B3C,color:#fff,stroke:#1A6B3C
     classDef decision fill:#0073BB,color:#fff,stroke:#005A8E
 
     class S1,S2,S3,S4,S5,S6,S7,S8,S9,S10 stage
+    class S2b iac
     class Approval gate
     class Push,Done terminal
     class Gate decision
@@ -102,10 +110,11 @@ flowchart TD
 |---|---|---|---|
 | 1 | **Clone Pipeline Files** | Check out the application source repo; bind Jenkins credentials for AWS and git | Auth failure, missing branch, network error |
 | 2 | **Clone Env Files** | Fetch a separate private config repo holding `.env` and environment-specific tfvars | Repo access denied, missing branch |
+| 2b | **IaC Security Scan (Checkov)** | Scan all Terraform files for security misconfigurations before any infra changes; skip rules in `.checkov.yaml` | Any HIGH or CRITICAL misconfiguration |
 | 3 | **Read Service Versions** | Parse `versions.properties` to get the current version per service | File missing or malformed |
 | 4 | **Prepare Image Tags** | Construct full ECR URIs (`ACCOUNT.dkr.ecr.REGION.amazonaws.com/PROJECT/SERVICE:ENV.x.y.z`) | — (computed step) |
 | 5 | **Build Docker Images** | `docker build --build-arg` per service; single Dockerfile → N images | Build error, compilation failure, failing tests |
-| 6 | **Security Scan (Trivy)** | Scan each local image for CRITICAL CVEs; `--ignore-unfixed` skips CVEs with no fix available | Any CRITICAL vulnerability with available fix |
+| 6 | **Image Scan (Trivy)** | Scan each local image for CRITICAL CVEs; `--ignore-unfixed` skips CVEs with no fix available | Any CRITICAL vulnerability with available fix |
 | 7 | **Push to ECR** | ECR auth, tag each image with full registry URI, push | ECR auth error, push failure, quota exceeded |
 | — | **Approval Gate** *(prod only)* | `input` step pauses pipeline and waits for explicit approval; 30-minute timeout | Approver rejects; times out |
 | 8 | **Terraform Init + Plan + Apply** | Reconfigure backend, plan with new image versions, apply; updates task definitions and corrects drift | Plan errors, apply errors, state lock timeout |

@@ -163,14 +163,17 @@ flowchart TD
 
     Push --> S1["1 · Clone Pipeline Files"]
     S1 --> S2["2 · Clone Env Files"]
-    S2 --> S3["3 · Read Service Versions
+    S2 --> S2b["2b · IaC Security Scan (Checkov)
+    checkov -d terraform/
+    Hard fail: HIGH · CRITICAL"]
+    S2b --> S3["3 · Read Service Versions
     Parse versions.properties"]
     S3 --> S4["4 · Prepare Image Tags
     ACCOUNT.dkr.ecr.REGION.amazonaws.com
     /PROJECT/SERVICE:ENV.MAJOR.MINOR.PATCH"]
     S4 --> S5["5 · Build Docker Images
     docker build --build-arg ENV --build-arg SERVICE"]
-    S5 --> S6["6 · Security Scan (Trivy)
+    S5 --> S6["6 · Image Scan (Trivy)
     --severity CRITICAL --ignore-unfixed
     Fails on any CRITICAL CVE"]
     S6 --> S7["7 · Push to ECR"]
@@ -196,11 +199,13 @@ flowchart TD
     S10 --> Done(["Deploy complete"])
 
     classDef stage    fill:#232F3E,color:#FF9900,stroke:#FF9900
+    classDef iac      fill:#B7410E,color:#fff,stroke:#8B2500
     classDef gate     fill:#7B2D8B,color:#fff,stroke:#9B4DB0
     classDef terminal fill:#1A6B3C,color:#fff,stroke:#1A6B3C
     classDef decision fill:#0073BB,color:#fff,stroke:#005A8E
 
     class S1,S2,S3,S4,S5,S6,S7,S8,S9,S10 stage
+    class S2b iac
     class Approval gate
     class Push,Done terminal
     class Gate decision
